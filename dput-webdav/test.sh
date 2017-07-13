@@ -42,8 +42,13 @@ if test $(ls -1 build/artifactory-debian-webdav-test*.changes | wc -l) -ne 1; th
     pushd build/deb >/dev/null
     export DEBFULLNAME="Tests R. Us"
     export DEBEMAIL="tests@example.com"
-    echo | dh_make -s --indep --createorig -p artifactory-debian-webdav-test_1.0
-    dpkg-buildpackage -uc -us 
+    dh_make_opts="--indep --createorig -p artifactory-debian-webdav-test_1.0"
+    if dh_make --help | grep .--yes >/dev/null; then
+        dh_make --yes $dh_make_opts
+    else
+        echo | dh_make $dh_make_opts
+    fi
+    dpkg-buildpackage -uc -us
     popd >/dev/null
 fi
 
@@ -69,9 +74,11 @@ grep "^D: webdav: Resolved login credentials to uploader:\\*" build/dput.log >/d
 dput_test 'artifactory-debian:integration-test' build/*.changes >build/dput2.log 2>&1 || :
 grep "/debian-local/snapshots/" build/dput2.log >/dev/null || fail "Repository mapping doesn't work"
 
+. .env --yes
+
 echo
 if which pylint >/dev/null; then
-    echo "Running pylint..."
+    echo "Running $(pylint --version | head -n1) from '$(which pylint)'..."
     pylint --rcfile ./pylint.cfg -d locally-disabled -rn webdav.py && RC=0 || RC=$?
     test $(($RC & 35)) -eq 0 || fail "pylint errors!"
 else
@@ -88,4 +95,3 @@ fi
 
 echo
 echo "** ALL OK **"
-

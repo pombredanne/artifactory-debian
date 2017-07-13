@@ -9,13 +9,13 @@ language: python
 python:
     - "2.7"
     - "2.6"
-    - "2.5"
 
 # command to install dependencies
+# ("dpkg-dev" omitted due to errors on Travis)
 install:
-    - "sudo apt-get install dput dh-make dpkg-dev"
-    - "test $TRAVIS_PYTHON_VERSION = 2.5 || pip install -M 'pylint>=1.0'"
+    - "sudo apt-get install dput dh-make fakeroot"
+    - "pip install -U pip"
+    - "pip install 'pylint>=1.0'"
 
 # command to run tests
 script: "bash -x dput-webdav/test.sh"
-

@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
-# pylint: disable=locally-disabled, star-args
+# pylint: disable=locally-disabled, bad-continuation
 """ WebDAV upload method for dput.
 
     Install to "/usr/share/dput/webdav.py".
 """
-from __future__ import with_statement
+from __future__ import with_statement, print_function
 
+import io
 import re
 import os
 import sys
@@ -14,6 +15,7 @@ import netrc
 import socket
 import fnmatch
 import getpass
+import hashlib
 import httplib
 import urllib2
 import urlparse
@@ -68,7 +70,7 @@ def _resolve_credentials(fqdn, login):
     else:
         if result.startswith("file:"):
             result = os.path.abspath(os.path.expanduser(result.split(':', 1)[1]))
-            with closing(open(result, "r")) as handle:
+            with closing(io.open(result, 'r', encoding='utf-8')) as handle:
                 result = handle.read().strip()
 
         try:
@@ -126,10 +128,10 @@ def _distro2repo(distro, repo_mappings):
 def _resolve_incoming(fqdn, login, incoming, changes=None, cli_params=None, repo_mappings=""):
     """Resolve the given `incoming` value to a working URL."""
     # Build fully qualified URL
-    scheme, netloc, path, params, query, anchor = urlparse.urlparse(incoming, scheme="http", allow_fragments=True)
+    scheme, netloc, path, matrix_params, query, anchor = urlparse.urlparse(incoming, scheme="http", allow_fragments=True)
     if scheme not in ("http", "https"):
         raise dputhelper.DputUploadFatalException("Unsupported URL scheme '%s'" % scheme)
-    url = urlparse.urlunparse((scheme, netloc or fqdn, path.rstrip('/') + '/', params, query, None))
+    url = urlparse.urlunparse((scheme, netloc or fqdn, path.rstrip('/') + '/', '', query, None))
 
     # Parse anchor to parameters
     url_params = dict(cgi.parse_qsl(anchor or '', keep_blank_values=True))
@@ -138,12 +140,17 @@ def _resolve_incoming(fqdn, login, incoming, changes=None, cli_params=None, repo
     pkgdata = {}
     if changes:
         try:
-            changes.read # pylint: disable=maybe-no-member
-        except AttributeError:
-            with closing(open(changes, "r")) as handle:
-                changes = handle.read()
-        else:
-            changes = changes.read() # pylint: disable=maybe-no-member
+            changes + ""
+        except TypeError:
+            try:
+                changes = changes.read() # pylint: disable=maybe-no-member
+            except AttributeError:
+                raise dputhelper.DputUploadFatalException(
+                    "Expected a file-like object with a change record, but got %r" % changes)
+        else:  # a string
+            if '\n' not in changes:
+                with closing(io.open(changes, 'r', encoding='utf-8')) as handle:
+                    changes = handle.read()
 
         if changes.startswith("-----BEGIN PGP SIGNED MESSAGE-----"):
             # Let someone else check this, we don't care a bit; gimme the data already
@@ -153,11 +160,16 @@ def _resolve_incoming(fqdn, login, incoming, changes=None, cli_params=None, repo
         pkgdata = dict([(key.lower().replace('-', '_'), val.strip())
             for key, val in rfc2822_parser.HeaderParser().parsestr(changes).items()
         ])
+        if 'architecture' in pkgdata:
+            # This is a bit hackish, but Artiactory wants it that way
+            pkgdata['deb_architecture'] = ';deb.architecture='.join(pkgdata['architecture'].split())
 
     # Extend changes metadata
     pkgdata["loginuser"] = login.split(':')[0]
     if "version" in pkgdata:
-        pkgdata["upstream"] = re.split(r"[-~]", pkgdata["version"])[0]
+        pkgdata["epoch"], pkgdata["upstream"] = '', re.split(r"[-~]", pkgdata["version"])[0]
+        if ':' in pkgdata["upstream"]:
+            pkgdata["epoch"], pkgdata["upstream"] = pkgdata["upstream"].split(':', 1)
     pkgdata.update(dict(
         fqdn=fqdn, repo=_distro2repo(pkgdata.get("distribution", "unknown"), repo_mappings),
     ))
@@ -173,28 +185,31 @@ def _resolve_incoming(fqdn, login, incoming, changes=None, cli_params=None, repo
             url.format
         except AttributeError:
             url = url % pkgdata # Python 2.5
+            matrix_params = matrix_params % pkgdata
         else:
             url = url.format(**pkgdata) # Python 2.6+
+            matrix_params = matrix_params.format(**pkgdata)
+        matrix_params = matrix_params.replace(' ', '+')
     except KeyError, exc:
         raise dputhelper.DputUploadFatalException("Unknown key (%s) in incoming templates '%s'" % (exc, incoming))
 
     trace("Resolved incoming to `%(url)s' params=%(params)r", url=url, params=url_params)
-    return url, url_params
+    return url, matrix_params, url_params
 
 
 def _url_connection(url, method, skip_host=False, skip_accept_encoding=False):
     """Create HTTP[S] connection for `url`."""
     scheme, netloc, path, params, query, _ = urlparse.urlparse(url)
     result = conn = (httplib.HTTPSConnection if scheme == "https" else httplib.HTTPConnection)(netloc)
-    conn.debuglevel = int(trace.debug)
     try:
+        conn.debuglevel = int(trace.debug)
         conn.putrequest(method, urlparse.urlunparse((None, None, path, params, query, None)), skip_host, skip_accept_encoding)
         conn.putheader("User-Agent", "dput")
         conn.putheader("Connection", "close")
-        conn = None
+        conn = None  # return open connections as result
     finally:
         if conn:
-            conn.close() # close in case of errors
+            conn.close()  # close in case of errors
 
     return result
 
@@ -205,14 +220,25 @@ def _file_url(filepath, url):
     return urlparse.urljoin(url.rstrip('/') + '/', basename)
 
 
-def _dav_put(filepath, url, login, progress=None):
+def _dav_put(filepath, url, matrix_params, login, progress=None):
     """Upload `filepath` to given `url` (referring to a WebDAV collection)."""
     fileurl = _file_url(filepath, url)
+    if matrix_params:
+        fileurl += ';' + matrix_params
     sys.stdout.write("  Uploading %s: " % os.path.basename(filepath))
     sys.stdout.flush()
     size = os.path.getsize(filepath)
 
-    with closing(open(filepath, 'r')) as handle:
+    hashes = dict([(x, getattr(hashlib, x)()) for x in ("md5", "sha1", "sha256")])
+    with closing(io.open(filepath, 'rb')) as handle:
+        while True:
+            data = handle.read(CHUNK_SIZE)
+            if not data:
+                break
+            for hashval in hashes.values():
+                hashval.update(data)
+
+    with closing(io.open(filepath, 'rb')) as handle:
         if progress:
             handle = dputhelper.FileWithProgress(handle, ptype=progress, progressf=sys.stdout, size=size)
         trace("HTTP PUT to URL: %s" % fileurl)
@@ -222,6 +248,8 @@ def _dav_put(filepath, url, login, progress=None):
             try:
                 conn.putheader("Authorization", 'Basic %s' % login.encode('base64').replace('\n', '').strip())
                 conn.putheader("Content-Length", str(size))
+                for algo, hashval in hashes.items():
+                    conn.putheader("X-Checksum-" + algo.capitalize(), hashval.hexdigest())
                 conn.endheaders()
 
                 conn.debuglevel = 0
@@ -234,16 +262,16 @@ def _dav_put(filepath, url, login, progress=None):
 
                 resp = conn.getresponse()
                 if 200 <= resp.status <= 299:
-                    print " done."
+                    print(" done.")
                 #elif res.status == 401 and not auth_headers:
                     #print "need authentication."
                     #auth_headers = AuthHandlerHackAround(url, res.msg, pwman).get_auth_headers()
                 elif resp.status == 401:
-                    print " unauthorized."
+                    print(" unauthorized.")
                     raise urllib2.URLError("Upload failed as unauthorized (%s),"
                         " maybe wrong username or password?" % resp.reason)
                 else:
-                    print " failed."
+                    print(" failed.")
                     raise urllib2.URLError("Unexpected HTTP status %d %s" % (resp.status, resp.reason))
 
                 resp.read() # eat response body
@@ -253,7 +281,7 @@ def _dav_put(filepath, url, login, progress=None):
             raise urllib2.URLError(exc)
 
 
-def _check_url(url, allowed, mindepth=0):
+def _check_url(url, login, allowed, mindepth=0):
     """Check if HTTP GET `url` returns a status code in `allowed`."""
     if mindepth:
         scheme, netloc, path, params, query, fragment = urlparse.urlparse(url)
@@ -262,8 +290,11 @@ def _check_url(url, allowed, mindepth=0):
 
     trace("Checking URL '%(url)s'", url=url)
     try:
-        # TODO: Check requests need to use login credentials
-        with closing(urllib2.urlopen(url)) as handle:
+        # Could use a HTTPBasicAuthHandler here, but meh!
+        # Should use 'requests', but dependency hell.
+        request = urllib2.Request(url)
+        request.add_header("Authorization", 'Basic %s' % login.encode('base64').replace('\n', '').strip())
+        with closing(urllib2.urlopen(request)) as handle:
             handle.read()
             code = handle.code
             if code not in allowed:
@@ -347,7 +378,7 @@ def upload(fqdn, login, incoming, files_to_upload, # pylint: disable=too-many-ar
             changes_file = changes_file[0]
 
         # Prepare for uploading
-        incoming, repo_params = _resolve_incoming(fqdn, login, incoming, changes=changes_file,
+        incoming, matrix_params, repo_params = _resolve_incoming(fqdn, login, incoming, changes=changes_file,
             cli_params=cli_params, repo_mappings=host_config.get("repo_mappings", ""))
         log("INFO: Destination base URL is\n    %(url)s", url=urllib2.quote(incoming, safe=":/~;#"))
         repo_params.update(cli_params)
@@ -359,12 +390,12 @@ def upload(fqdn, login, incoming, files_to_upload, # pylint: disable=too-many-ar
         # Special handling for integration test code
         if "integration-test" in cli_params:
             import pprint
-            print "upload arguments = ",
+            print("upload arguments = ", end="")
             pprint.pprint(dict((k, v) for k, v in locals().iteritems() if k in (
                 "fqdn", "login", "incoming", "files_to_upload", "debug", "dummy", "progress")))
-            print "host config = ",
+            print("host config = ", end="")
             pprint.pprint(host_config)
-            print "host arguments = ",
+            print("host arguments = ", end="")
             pprint.pprint(cli_params)
         else:
             # TODO: "bintray" REST API support
@@ -374,7 +405,7 @@ def upload(fqdn, login, incoming, files_to_upload, # pylint: disable=too-many-ar
             # Check if .changes file already exists
             if not overwrite and changes_file:
                 try:
-                    _check_url(_file_url(changes_file, incoming), [404])
+                    _check_url(_file_url(changes_file, incoming), login, [404])
                 except urllib2.HTTPError, exc:
                     raise dputhelper.DputUploadFatalException("Overwriting existing changes at '%s' not allowed: %s" % (
                         _file_url(changes_file, incoming), exc))
@@ -382,7 +413,7 @@ def upload(fqdn, login, incoming, files_to_upload, # pylint: disable=too-many-ar
             # Check for existence of target path with minimal depth
             if mindepth:
                 try:
-                    _check_url(incoming, range(200, 300), mindepth=mindepth)
+                    _check_url(incoming, login, range(200, 300), mindepth=mindepth)
                 except urllib2.HTTPError, exc:
                     raise dputhelper.DputUploadFatalException("Required repository path '%s' doesn't exist: %s" % (
                         exc.filename, exc))
@@ -392,7 +423,7 @@ def upload(fqdn, login, incoming, files_to_upload, # pylint: disable=too-many-ar
                 if "simulate" in cli_params:
                     log("WOULD upload '%(filename)s'", filename=os.path.basename(filepath))
                 else:
-                    _dav_put(filepath, incoming, login, progress)
+                    _dav_put(filepath, incoming, matrix_params, login, progress)
     except (dputhelper.DputUploadFatalException, socket.error, urllib2.URLError, EnvironmentError), exc:
         log("FATAL: %(exc)s", exc=exc)
         sys.exit(1)
@@ -431,24 +462,39 @@ class WebdavTest(unittest.TestCase): # pylint: disable=too-many-public-methods
 
     def test_resolve_incoming(self):
         """Test URL resolving."""
-        result, params = _resolve_incoming("repo.example.com:80", "", "incoming")
+        result, _, params = _resolve_incoming("repo.example.com:80", "", "incoming")
         self.assertEquals(result, "http://repo.example.com:80/incoming/")
         self.assertEquals(params, {})
 
-        result, _ = _resolve_incoming("repo.example.com:80", "", "https:///incoming/")
+        result, _, _ = _resolve_incoming("repo.example.com:80", "", "https:///incoming/")
         self.assertEquals(result, "https://repo.example.com:80/incoming/")
 
-        result, _ = _resolve_incoming("repo.example.com:80", "", "//explicit/incoming/")
+        result, _, _ = _resolve_incoming("repo.example.com:80", "", "//explicit/incoming/")
         self.assertEquals(result, "http://explicit/incoming/")
 
-        result, _ = _resolve_incoming("repo.example.com:80", "", py25_format("//{fqdn}/incoming/"))
+        result, _, _ = _resolve_incoming("repo.example.com:80", "", py25_format("//{fqdn}/incoming/"))
         self.assertEquals(result, "http://repo.example.com:80/incoming/")
 
-        _, params = _resolve_incoming("", "", "incoming#a=1&b=c")
+        _, _, params = _resolve_incoming("", "", "incoming#a=1&b=c")
         self.assertEquals(params, dict(a="1", b="c"))
 
-        result, _ = _resolve_incoming("repo.example.com:80", "johndoe", py25_format("incoming/{loginuser}"))
+        result, _, _ = _resolve_incoming("repo.example.com:80", "johndoe", py25_format("incoming/{loginuser}"))
         self.assertEquals(result, "http://repo.example.com:80/incoming/johndoe/")
+
+        # Version parsing
+        for version in (('', '1.2.3'), ('1', '2.3.4')):
+            changes = '\n'.join([
+                "Source: dput-webdav-version-test",
+                "Version: {0}{1}{2}".format(version[0], ':' if version[0] else '', version[1]),
+                ''])
+            result, _, _ = _resolve_incoming("repo.example.com:80", "",
+                py25_format("v/{epoch}/{upstream}"), changes=changes)
+            self.assertEquals(result, "http://repo.example.com:80/v/{0}/{1}/".format(*version))
+
+        # Matrix parameters
+        result, matrix_params, _ = _resolve_incoming("repo.example.com:80", "", "/a/b;foo=bar;bar=foo")
+        self.assertEquals(result, "http://repo.example.com:80/a/b/")
+        self.assertEquals(matrix_params, "foo=bar;bar=foo")
 
         # Unsupported URL scheme
         self.assertRaises(dputhelper.DputUploadFatalException, _resolve_incoming, "", "", "file:///incoming/")
@@ -459,5 +505,8 @@ class WebdavTest(unittest.TestCase): # pylint: disable=too-many-public-methods
 
 
 if __name__ == "__main__":
+    import mock
+
     print("artifactory webdav plugin tests")
+    #trace.debug = True
     unittest.main()

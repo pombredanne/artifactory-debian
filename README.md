@@ -1,11 +1,11 @@
 # ![Logo](https://raw.github.com/jhermann/artifactory-debian/master/doc/_static/artifactory-debian-logo.png) Debian Repositories in Artifactory
 
 `artifactory-debian` offers tools to use [Artifactory](http://www.jfrog.com/) as a Debian (APT) repository,
-and deploy DEB packages to it. Also see [the wiki](https://github.com/jhermann/artifactory-debian/wiki).
+and conveniently [upload DEB packages](#package-uploading) to *Artifactory* or *Bintray*. Also see [the wiki](https://github.com/jhermann/artifactory-debian/wiki).
 
-| **dput-webdav** | **Ohloh** |
+| **dput-webdav** | **Open HUB** |
 |:-------------:|:-------------:|
-| [![Travis Status](https://travis-ci.org/jhermann/artifactory-debian.png?branch=master)](https://travis-ci.org/jhermann/artifactory-debian) [![Jenkins Status](https://huschteguzzel.de/hudson/buildStatus/icon?job=dput-webdav)](https://huschteguzzel.de/hudson/view/jhermann/job/dput-webdav/) [![Open Tasks](https://raw.github.com/jhermann/artifactory-debian/master/doc/_static/todo.png)](https://huschteguzzel.de/hudson/view/jhermann/job/dput-webdav/tasks) | [![Ohloh stats](https://www.ohloh.net/p/artifactory-debian/widgets/project_thin_badge.gif)](https://www.ohloh.net/p/artifactory-debian) |
+| [![Travis Status](https://travis-ci.org/jhermann/artifactory-debian.png?branch=master)](https://travis-ci.org/jhermann/artifactory-debian)  [![Download](https://api.bintray.com/packages/jhermann/deb/dput-webdav/images/download.svg) ](https://bintray.com/jhermann/deb/dput-webdav/_latestVersion) | [![Ohloh stats](https://www.ohloh.net/p/artifactory-debian/widgets/project_thin_badge.gif)](https://www.ohloh.net/p/artifactory-debian) |
 
 **Table of Contents**
 - [Motivation and Overview](#motivation-and-overview)
@@ -33,12 +33,18 @@ additional advantage of attribute management on top of storing the contained fil
 With that you can for example add cryptographic signatures of passed quality gates and the like,
 when a candidate release progresses through the pipeline.
 
-As long as [RTFACT-4613](https://www.jfrog.com/jira/browse/RTFACT-4613) remains unresolved,
-this project enables you to manage your Debian packages within Artifactory here and now.
-It offers a shell script that indexes a set of Debian repos located in Artifactory,
-and a `dput` plugin that allows you to continue to use the standard Debian tool chain.
+:mega: | Starting with version 3.3, Artifactory can handle Debian repositories natively (see [RTFACT-4613](https://www.jfrog.com/jira/browse/RTFACT-4613)). This project enabled you to manage your Debian packages within Artifactory before that, and still provides the `dput` plugin for easy uploading to a repository using the standard Debian tool chain.
+----: | :----
 
 The following diagram shows a typical setup and how the components interact.
+When a package maintainer uploads to Artifactory using `dput`,
+a `post_upload_command` remotely triggers a Jenkins job that pulls
+the repository configuration (from a local SCM) and the indexing code (from GitHub).
+That job then scans the available repositories using a read-only `davfs2` mount,
+creates new index files, and finally uploads those back into Artifactory.
+Users can then download the index files via `apt-get update` and install available packages as usual,
+without realizing they're accessing an Artifactory server, except for the specific `apt` source definition syntax
+(for details see [Installing Packages from Artifactory Repositories](#installing-packages-from-artifactory-repositories)).
 
 ![Configuration & Data Flow](https://raw.github.com/jhermann/artifactory-debian/master/doc/_static/data-flow.png)
 
@@ -162,10 +168,6 @@ Support for [dput-ng](http://people.debian.org/~paultag/dput-ng/) might be a goo
 
 **Package Installation**
 
-Download the latest
-[GitHub master build](https://huschteguzzel.de/hudson/job/dput-webdav/lastSuccessfulBuild/artifact/dput-webdav_1%7Emaster_all.deb)
-and install it with either `dpkg -i` or directly from your browser, using the *Ubuntu Software Center* or a similar tool.
-
 To install a **release version** via adding [Bintray](https://bintray.com/jhermann/deb/dput-webdav) as a package source, run these commands as `root`:
 
 ```sh
@@ -175,6 +177,10 @@ apt-get update
 apt-get install -o "APT::Get::AllowUnauthenticated=yes" dput-webdav
 ```
 
+If you need to build from source, change into the ``dput-webdav`` directory
+of this project, and call ``dpkg-buildpackage -uc -us``.
+The package files will be created in the project root, use ``dpkg -i …`` to install.
+
 
 **Manual Installation**
 
@@ -183,7 +189,7 @@ or have a version of `dput` other than `0.9.6` installed,
 copy the plugin from GitHub using this command:
 
 ```sh
-sudo bash -c "umask 0133; curl -skS -o /usr/share/dput/webdav.py \
+sudo bash -c "umask 0133; curl -skSL -o /usr/share/dput/webdav.py \
     https://raw.github.com/jhermann/artifactory-debian/master/dput-webdav/webdav.py"
 ```
 
@@ -223,6 +229,21 @@ allow_unsigned_uploads = 1
 
 * Call `⍽ echo -n "«username»:«password»" >~/.artifactory.credentials; chmod 600 ~/.artifactory.credentials` with your credentials filled in (put a space in front to exclude the command from shell history).
 
+  It's recommended to use your *“Encrypted Password”* instead of the cleartext password. That password starts with ``AP`` and is revealed after you **unlock** the *“User Profile”* page in the web UI.
+
+  Of course, you can also use the ``~/.netrc`` file, instead of a specific ``~/.artifactory.credentials`` one, as outlined in the next section.
+
+The above `~/.dput.cf` works with the indexing solution contained in this project.
+If by now you use the *built-in* Debian repository type of Artifactory,
+remove or comment the `post_upload_command` (it's not longer needed, indexing is automatic),
+and change the `incoming` value as follows:
+
+```ini
+incoming = http://{fqdn}/artifactory/debian-local/pool/{source}/{upstream};deb.architecture={deb_architecture};deb.component=local;deb.distribution={repo}#mindepth=3&overwrite=0
+```
+
+Replace the `debian-local` path component if you named your repository differently.
+
 To fully understand the `dput` WebDAV plugin configuration and be able to customize it,
 read [WebDAV Plugin Configuration](https://github.com/jhermann/artifactory-debian/wiki/WebDAV-Plugin-Configuration).
 Also refer to `man dput.cf` for the common configuration options shared by all upload methods.
@@ -255,7 +276,7 @@ machine api.bintray.com
 
 As an example, the following is the log of the first release, where `dput-webdav` uploaded itself:
 
-```sh
+```console
 $ dput bintray dput-webdav*changes
 Uploading to bintray (via webdav to api.bintray.com):
   Uploading dput-webdav_1.0.dsc:  done.
